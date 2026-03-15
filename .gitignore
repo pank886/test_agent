@@ -1,0 +1,9 @@
+.env
+
+my_chroma_db
+
+.venv
+
+.vscode
+
+.idea
