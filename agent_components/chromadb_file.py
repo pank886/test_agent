@@ -1,0 +1,165 @@
+from dotenv import load_dotenv, find_dotenv
+load_dotenv(find_dotenv())
+
+import os
+from typing import List, Optional, Union
+from pathlib import Path
+
+# 第三方库
+from pypdf import PdfReader
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langchain_ollama import OllamaEmbeddings
+from langchain_core.documents import Document
+from langchain_chroma import Chroma
+
+
+class ReadersChromadb:
+    def __init__(
+            self,
+            persist_directory: str = "./my_chroma_db",
+            collection_name: str = "my_rag_collection",
+            embedding_model_name: str = None,
+            base_url: Optional[str] = None
+    ):
+        """
+        初始化工具类
+        :param persist_directory: 向量数据库持久化路径
+        :param collection_name: 集合名称
+        :param embedding_model_name: 嵌入模型名称
+        :param base_url: Ollama 服务地址
+        """
+        self.persist_directory = persist_directory
+        self.collection_name = collection_name
+
+        if base_url is None:
+            base_url = os.environ.get("EMBEDDING_URL", "http://localhost:11434")
+
+        final_model_name = embedding_model_name or os.environ.get("EMBEDDING_MODEL")
+
+        # 3. 初始化 Embeddings (使用最终确定的名字)
+        try:
+            self.embeddings = OllamaEmbeddings(
+                model=final_model_name,
+                base_url=base_url
+            )
+            print(f"ℹ️ 使用 Embedding 模型: {final_model_name}")
+        except Exception as e:
+            print(f"⚠️ 警告: Embeddings 初始化可能失败，请检查 Ollama 服务是否启动或模型是否安装。错误: {e}")
+
+        # 4. 初始化向量数据库
+        self.vector_store = Chroma(
+            persist_directory=self.persist_directory,
+            embedding_function=self.embeddings,
+            collection_name=self.collection_name
+        )
+
+    def extract_text_from_pdf(self, pdf_path: Union[str, Path]) -> str:
+        """
+        提取 PDF 纯文本（仅用于不需要页码的场景，建议优先使用 process_pdf_to_docs）
+        """
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"文件不存在: {pdf_path}")
+
+        try:
+            reader = PdfReader(pdf_path)
+            if not reader.pages:
+                raise ValueError("PDF 文件为空或无法读取页面")
+
+            full_text = "\n\n".join([page.extract_text() for page in reader.pages])
+
+            if not full_text.strip():
+                print("⚠️ 警告: 提取的文本为空，可能是扫描版 PDF。")
+
+            return full_text
+        except Exception as e:
+            raise ValueError(f"PDF 解析错误: {e}") #from e
+
+    def process_pdf_to_docs(self, pdf_path: Union[str, Path]) -> List[Document]:
+        """
+        【核心功能】读取 PDF 并转换为带元数据的 Document 列表
+        这是推荐的调用方式，因为它保留了页码信息。
+        """
+        if not os.path.exists(pdf_path):
+            raise FileNotFoundError(f"文件不存在: {pdf_path}")
+
+        documents = []
+        reader = PdfReader(pdf_path)
+
+        # 文本切分器配置
+        text_splitter = RecursiveCharacterTextSplitter(
+            chunk_size=1000,
+            chunk_overlap=200,
+            separators=["\n\n", "\n", "。", "，", " ", ""]  # 针对中文优化分隔符
+        )
+
+        print(f"📄 正在处理文件: {os.path.basename(pdf_path)} (共 {len(reader.pages)} 页)...")
+
+        for i, page in enumerate(reader.pages):
+            text = page.extract_text()
+            # 过滤掉空白页
+            if text and text.strip():
+                doc = Document(
+                    page_content=text,
+                    metadata={
+                        "source": str(pdf_path),
+                        "page": i + 1,
+                        "type": "pdf"
+                    }
+                )
+                # 切分
+                sub_docs = text_splitter.split_documents([doc])
+                documents.extend(sub_docs)
+
+        return documents
+
+    def add_documents(self, documents: List[Document]):
+        """
+        将处理好的文档存入向量数据库
+        """
+        if not documents:
+            print("⚠️ 没有文档需要存储。")
+            return
+
+        print(f"🚀 正在向量化并存储 {len(documents)} 个文本块...")
+        self.vector_store.add_documents(documents=documents)
+        print("✅ 存储完成！")
+
+    def search_context(self, user_question_str: str, k: int = 5) -> str:
+        """
+        搜索最相关的上下文
+        :param user_question_str: 用户问题
+        :param k: 返回的片段数量
+        :return: 拼接后的上下文文本
+        """
+        if not user_question_str.strip():
+            return ""
+
+        results = self.vector_store.similarity_search(user_question_str, k=k)
+
+        if not results:
+            return "未在知识库中找到相关内容。"
+
+        context_parts = []
+        for doc in results:
+            # 格式化输出，包含来源和页码，方便 LLM 理解上下文来源
+            source = doc.metadata.get("source", "未知来源")
+            page = doc.metadata.get("page", "")
+
+            # 添加头部信息
+            header = f"[来源: {os.path.basename(source)}"
+            if page:
+                header += f" - 第 {page} 页"
+            header += "]\n"
+
+            context_parts.append(header + doc.page_content)
+
+        # 使用明显的分隔符拼接
+        return "\n\n---\n\n".join(context_parts)
+
+
+if __name__ == "__main__":
+    reader = ReadersChromadb()
+    pdftext = reader.process_pdf_to_docs(r'D:\coffee_swagger.pdf')
+    reader.add_documents(pdftext)
+    ans = reader.search_context(user_question_str="订单接口文档")
+    print("文档内容_全：", ans)
